@@ -86,6 +86,31 @@ struct SetAccumulator {
     }
   }
 
+  void addSerialized(
+      const FlatVector<StringView>& vector,
+      vector_size_t index,
+      HashStringAllocator* /*allocator*/) {
+    VELOX_CHECK(!vector.isNullAt(index));
+    auto serialized = vector.valueAt(index);
+    vector_size_t serializedNullIndex;
+    memcpy(&serializedNullIndex, serialized.data(), kVectorSizeT);
+    if (!nullIndex.has_value() && serializedNullIndex != kNoNullIndex) {
+      nullIndex = serializedNullIndex;
+    }
+
+    T value;
+    auto valueSize = sizeof(T);
+    size_t valueIndex;
+    auto offset = kVectorSizeT;
+    while (offset < serialized.size()) {
+      memcpy(&value, serialized.data() + offset, valueSize);
+      offset += valueSize;
+      memcpy(&valueIndex, serialized.data() + offset, kVectorSizeT);
+      offset += kVectorSizeT;
+      uniqueValues.insert({value, valueIndex});
+    }
+  }
+
   /// Returns number of unique values including null.
   size_t size() const {
     return uniqueValues.size() + (nullIndex.has_value() ? 1 : 0);
@@ -106,10 +131,39 @@ struct SetAccumulator {
                                  : uniqueValues.size();
   }
 
+  /// Extracts in result[index] a serialized VARBINARY for the Set Values.
+  /// This is used for the spill of this accumulator.
+  void extractSerialized(const VectorPtr& result, vector_size_t index) {
+    // The serialized value is the nullOffset (kNoNullIndex if no null is
+    // present) followed by pairs of each unique value and its respective index.
+    size_t valueSize = sizeof(T);
+    size_t totalBytes =
+        (valueSize + kVectorSizeT) * uniqueValues.size() + kVectorSizeT;
+
+    auto* flatResult = result->as<FlatVector<StringView>>();
+    auto* rawBuffer = flatResult->getRawStringBufferWithSpace(totalBytes, true);
+    auto serializedNullIndex =
+        nullIndex.has_value() ? nullIndex.value() : kNoNullIndex;
+    memcpy(rawBuffer, &serializedNullIndex, kVectorSizeT);
+
+    size_t offset = kVectorSizeT;
+    for (auto value : uniqueValues) {
+      memcpy(rawBuffer + offset, &(value.first), valueSize);
+      offset += valueSize;
+      memcpy(rawBuffer + offset, &(value.second), kVectorSizeT);
+      offset += kVectorSizeT;
+    }
+    flatResult->setNoCopy(index, StringView(rawBuffer, totalBytes));
+    return;
+  }
+
   void free(HashStringAllocator& allocator) {
     using UT = decltype(uniqueValues);
     uniqueValues.~UT();
   }
+
+  static const vector_size_t kNoNullIndex = -1;
+  static constexpr size_t kVectorSizeT = sizeof(vector_size_t);
 };
 
 /// Maintains a set of unique strings.
@@ -119,6 +173,10 @@ struct StringViewSetAccumulator {
 
   /// Stores unique non-null non-inline strings.
   Strings strings;
+
+  /// Size (in bytes) of the string values. Used for computing serialized
+  /// buffer size for spilling.
+  size_t stringSetBytes = 0;
 
   StringViewSetAccumulator(const TypePtr& type, HashStringAllocator* allocator)
       : base{type, allocator} {}
@@ -134,14 +192,7 @@ struct StringViewSetAccumulator {
       }
     } else {
       auto value = decoded.valueAt<StringView>(index);
-      if (!value.isInline()) {
-        if (base.uniqueValues.contains(value)) {
-          return;
-        }
-        value = strings.append(value, *allocator);
-      }
-      base.uniqueValues.insert(
-          {value, base.nullIndex.has_value() ? cnt + 1 : cnt});
+      addValue(value, base.nullIndex.has_value() ? cnt + 1 : cnt, allocator);
     }
   }
 
@@ -158,6 +209,38 @@ struct StringViewSetAccumulator {
     }
   }
 
+  void addSerialized(
+      const FlatVector<StringView>& vector,
+      vector_size_t index,
+      HashStringAllocator* allocator) {
+    VELOX_CHECK(!vector.isNullAt(index));
+    auto serialized = vector.valueAt(index);
+    auto serializedBuffer = serialized.data();
+    auto serializedSize = serialized.size();
+
+    vector_size_t nullIndex;
+    memcpy(&nullIndex, serializedBuffer, base.kVectorSizeT);
+    if (!base.nullIndex.has_value() && nullIndex != base.kNoNullIndex) {
+      base.nullIndex = nullIndex;
+    }
+
+    size_t offset = base.kVectorSizeT;
+    vector_size_t length;
+    vector_size_t valueIndex;
+    while (offset < serializedSize) {
+      memcpy(&length, serializedBuffer + offset, base.kVectorSizeT);
+      offset += 4;
+
+      StringView value = StringView(serializedBuffer + offset, length);
+      offset += length;
+
+      memcpy(&valueIndex, serializedBuffer + offset, base.kVectorSizeT);
+      offset += base.kVectorSizeT;
+
+      addValue(value, valueIndex, allocator);
+    }
+  }
+
   size_t size() const {
     return base.size();
   }
@@ -168,10 +251,57 @@ struct StringViewSetAccumulator {
     return base.extractValues(values, offset);
   }
 
+  /// Extracts in result[index] a serialized VARBINARY for the String Values.
+  /// This is used for the spill of this accumulator.
+  void extractSerialized(const VectorPtr& result, vector_size_t index) {
+    // nullIndex (or kNoNullIndex) is serialized followed by triples of
+    // (valueSize, String value, valueIndex) of the unique values.
+    int32_t totalBytes = base.kVectorSizeT + stringSetBytes +
+        2 * base.kVectorSizeT * base.uniqueValues.size();
+
+    auto* flatResult = result->as<FlatVector<StringView>>();
+    auto* rawBuffer = flatResult->getRawStringBufferWithSpace(totalBytes, true);
+
+    auto nullIndex =
+        base.nullIndex.has_value() ? base.nullIndex.value() : base.kNoNullIndex;
+    memcpy(rawBuffer, &nullIndex, base.kVectorSizeT);
+
+    size_t offset = base.kVectorSizeT;
+    vector_size_t valueSize;
+    for (const auto& value : base.uniqueValues) {
+      valueSize = value.first.size();
+      memcpy(rawBuffer + offset, &valueSize, base.kVectorSizeT);
+      offset += 4;
+      memcpy(rawBuffer + offset, value.first.data(), valueSize);
+      offset += valueSize;
+      memcpy(rawBuffer + offset, &value.second, base.kVectorSizeT);
+      offset += base.kVectorSizeT;
+    }
+
+    flatResult->setNoCopy(index, StringView(rawBuffer, totalBytes));
+    return;
+  }
+
   void free(HashStringAllocator& allocator) {
     strings.free(allocator);
     using Base = decltype(base);
     base.~Base();
+  }
+
+ private:
+  void addValue(
+      const StringView& value,
+      vector_size_t valueIndex,
+      HashStringAllocator* allocator) {
+    if (base.uniqueValues.contains(value)) {
+      return;
+    }
+    StringView insertValue = value;
+    if (!insertValue.isInline()) {
+      insertValue = strings.append(value, *allocator);
+    }
+    base.uniqueValues.insert({insertValue, valueIndex});
+    stringSetBytes += insertValue.size();
   }
 };
 
@@ -186,6 +316,16 @@ struct ComplexTypeSetAccumulator {
 
   /// Stores unique non-null values.
   AddressableNonNullValueList values;
+
+  /// Tracks allocated bytes for sizing during serialization for spill.
+  size_t allValuesSize = 0;
+
+  std::unordered_map<
+      HashStringAllocator::Position,
+      size_t,
+      AddressableNonNullValueList::Hash,
+      AddressableNonNullValueList::HashEqualTo>
+      valuesLengths;
 
   ComplexTypeSetAccumulator(const TypePtr& type, HashStringAllocator* allocator)
       : base{
@@ -203,12 +343,17 @@ struct ComplexTypeSetAccumulator {
         base.nullIndex = cnt;
       }
     } else {
+      auto startSize = allocator->cumulativeBytes();
       auto position = values.append(decoded, index, allocator);
 
       if (!base.uniqueValues
                .insert({position, base.nullIndex.has_value() ? cnt + 1 : cnt})
                .second) {
         values.removeLast(position);
+      } else {
+        auto valueSize = allocator->cumulativeBytes() - startSize;
+        allValuesSize += valueSize;
+        valuesLengths.insert({position, valueSize});
       }
     }
   }
@@ -223,6 +368,43 @@ struct ComplexTypeSetAccumulator {
 
     for (auto i = 0; i < size; ++i) {
       addValue(values, offset + i, allocator);
+    }
+  }
+
+  void addSerialized(
+      const FlatVector<StringView>& vector,
+      vector_size_t index,
+      HashStringAllocator* allocator) {
+    VELOX_CHECK(!vector.isNullAt(index));
+    auto serialized = vector.valueAt(index);
+    vector_size_t nullIndex;
+    memcpy(&nullIndex, serialized.data(), base.kVectorSizeT);
+    if (!base.nullIndex.has_value() && nullIndex != base.kNoNullIndex) {
+      base.nullIndex = nullIndex;
+    }
+
+    auto offset = base.kVectorSizeT;
+    size_t length;
+    size_t valueIndex;
+    while (offset < serialized.size()) {
+      memcpy(&length, serialized.data() + offset, 4);
+      offset += 4;
+
+      StringView value = StringView(serialized.data() + offset, length);
+      offset += length;
+
+      memcpy(&valueIndex, serialized.data() + offset, base.kVectorSizeT);
+
+      auto startSize = allocator->cumulativeBytes();
+      auto position = values.appendSerialized(value, allocator);
+
+      if (!base.uniqueValues.insert({position, valueIndex}).second) {
+        values.removeLast(position);
+      } else {
+        auto valueSize = allocator->cumulativeBytes() - startSize;
+        allValuesSize += valueSize;
+        valuesLengths.insert({position, valueSize});
+      }
     }
   }
 
@@ -241,6 +423,37 @@ struct ComplexTypeSetAccumulator {
     }
 
     return base.uniqueValues.size() + (base.nullIndex.has_value() ? 1 : 0);
+  }
+
+  /// Extracts in result[index] a serialized VARBINARY for the String Values.
+  /// This is used for the spill of this accumulator.
+  void extractSerialized(const VectorPtr& result, vector_size_t index) {
+    // nullIndex is serialized followed by triples of (value size,
+    // ComplexType value, value index) of all unique values.
+    size_t totalBytes =
+        base.kVectorSizeT + (4 + base.kVectorSizeT) * size() + allValuesSize;
+
+    auto* flatResult = result->as<FlatVector<StringView>>();
+    auto* rawBuffer = flatResult->getRawStringBufferWithSpace(totalBytes, true);
+
+    vector_size_t nullIndex =
+        base.nullIndex.has_value() ? base.nullIndex.value() : base.kNoNullIndex;
+    memcpy(rawBuffer, &nullIndex, base.kVectorSizeT);
+
+    size_t offset = base.kVectorSizeT;
+    for (const auto& value : base.uniqueValues) {
+      VELOX_CHECK(valuesLengths.count(value.first) != 0);
+      auto length = valuesLengths[value.first];
+      memcpy(rawBuffer + offset, &length, 4);
+      offset += 4;
+      AddressableNonNullValueList::copy(
+          value.first, rawBuffer + offset, length);
+      offset += length;
+      memcpy(rawBuffer + offset, &value.second, base.kVectorSizeT);
+    }
+
+    flatResult->setNoCopy(index, StringView(rawBuffer, totalBytes));
+    return;
   }
 
   void free(HashStringAllocator& allocator) {

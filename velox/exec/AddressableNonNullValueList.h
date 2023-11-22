@@ -46,11 +46,26 @@ class AddressableNonNullValueList {
     }
   };
 
+  struct HashEqualTo {
+    bool operator()(
+        HashStringAllocator::Position left,
+        HashStringAllocator::Position right) const {
+      return AddressableNonNullValueList::readHash(left) ==
+          AddressableNonNullValueList::readHash(right);
+    }
+  };
+
   /// Append a non-null value to the end of the list. Returns 'index' that can
   /// be used to access the value later.
   HashStringAllocator::Position append(
       const DecodedVector& decoded,
       vector_size_t index,
+      HashStringAllocator* allocator);
+
+  /// Append a non-null serialized (hash + value) to the end of the list.
+  /// Returns position that can be used to access the value later.
+  HashStringAllocator::Position appendSerialized(
+      const StringView& value,
       HashStringAllocator* allocator);
 
   /// Removes last element. 'position' must be a value returned from the latest
@@ -79,6 +94,10 @@ class AddressableNonNullValueList {
       HashStringAllocator::Position position,
       BaseVector& result,
       vector_size_t index);
+
+  /// Copies numBytes at position to 'dest'.
+  static void
+  copy(HashStringAllocator::Position position, void* dest, size_t numBytes);
 
   void free(HashStringAllocator& allocator) {
     if (size_ > 0) {

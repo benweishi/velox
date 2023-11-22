@@ -50,6 +50,33 @@ HashStringAllocator::Position AddressableNonNullValueList::append(
   return startAndFinish.first;
 }
 
+HashStringAllocator::Position AddressableNonNullValueList::appendSerialized(
+    const StringView& value,
+    HashStringAllocator* allocator) {
+  ByteOutputStream stream(allocator);
+  if (!firstHeader_) {
+    // An array_agg or related begins with an allocation of 5 words and
+    // 4 bytes for header. This is compact for small arrays (up to 5
+    // bigints) and efficient if needs to be extended (stores 4 bigints
+    // and a next pointer. This could be adaptive, with smaller initial
+    // sizes for lots of small arrays.
+    static constexpr int kInitialSize = 44;
+
+    currentPosition_ = allocator->newWrite(stream, kInitialSize);
+    firstHeader_ = currentPosition_.header;
+  } else {
+    allocator->extendWrite(currentPosition_, stream);
+  }
+
+  // Value has both hash followed by the Complex type value.
+  stream.appendStringView(value);
+  ++size_;
+
+  auto startAndFinish = allocator->finishWrite(stream, 1024);
+  currentPosition_ = startAndFinish.second;
+  return startAndFinish.first;
+}
+
 namespace {
 
 ByteInputStream prepareRead(
@@ -95,6 +122,15 @@ void AddressableNonNullValueList::read(
     vector_size_t index) {
   auto stream = prepareRead(position, true /*skipHash*/);
   exec::ContainerRowSerde::deserialize(stream, index, &result);
+}
+
+// static
+void AddressableNonNullValueList::copy(
+    HashStringAllocator::Position position,
+    void* dest,
+    size_t numBytes) {
+  auto stream = prepareRead(position, true /*skipHash*/);
+  stream.readBytes(dest, numBytes);
 }
 
 } // namespace facebook::velox::aggregate::prestosql
